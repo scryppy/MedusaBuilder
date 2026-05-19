@@ -3,187 +3,176 @@
 import ast
 import random
 import string
+from rich.console import Console
 from .base import BuildContext, ObfuscationStrategy
 from .string_obfuscator import SessionObfuscator
 
-# --- Classes de Transformação AST (do seu polymorphic_engine.py) ---
+console = Console()
+
 
 class StringObfuscatorTransformer(ast.NodeTransformer):
+
     def __init__(self, session_obfuscator: SessionObfuscator):
         super().__init__()
         self.session_obfuscator = session_obfuscator
-        self.obfuscation_enabled = True  # Novo: um interruptor para a ofuscação
+        self.obfuscation_enabled = True
         self.strings_to_ignore = {
             "%%C2_SERVER_URL%%", "%%C2_PROFILE%%", "%%DEBUG_MODE%%",
             "utf-8", "w", "r", "a", "rb", "wb", "__main__",
         }
 
     def visit_JoinedStr(self, node):
-        """
-        Este método é chamado ANTES de visitar os filhos de uma f-string.
-        """
-        # 1. Desliga a ofuscação de strings
+        """Desliga ofuscação dentro de f-strings para não quebrar a sintaxe."""
         self.obfuscation_enabled = False
-        
-        # 2. Continua a visita normalmente (processa os filhos da f-string)
-        # Como o interruptor está desligado, o visit_Constant não fará nada.
-        self.generic_visit(node)
-        
-        # 3. Liga a ofuscação de strings novamente após sair da f-string
+        node = self.generic_visit(node)
         self.obfuscation_enabled = True
-        
-        # 4. Retorna o nó f-string original, sem alterações
         return node
 
     def visit_Constant(self, node):
-        """
-        Este método agora verifica o interruptor 'obfuscation_enabled'.
-        """
-        # Só tenta ofuscar se o interruptor estiver ligado
-        if self.obfuscation_enabled and isinstance(node.value, str) and node.value not in self.strings_to_ignore and len(node.value) > 2:
+        if (
+            self.obfuscation_enabled
+            and isinstance(node.value, str)
+            and node.value not in self.strings_to_ignore
+            and len(node.value) > 2
+        ):
             iv_b64, encrypted_data_b64 = self.session_obfuscator.obfuscate(node.value)
-            
             call_node = ast.Call(
                 func=ast.Name(id='rs', ctx=ast.Load()),
-                args=[ast.Constant(value=encrypted_data_b64), ast.Constant(value=iv_b64)],
+                args=[
+                    ast.Constant(value=encrypted_data_b64),
+                    ast.Constant(value=iv_b64)
+                ],
                 keywords=[]
             )
             return ast.copy_location(call_node, node)
-            
-        # Se o interruptor estiver desligado, ou se a string não for candidata, retorna o nó original.
         return node
 
 
-class GlobalDefinitionVisitor(ast.NodeVisitor):
-    """
-    Este novo visitor encontra APENAS funções e classes
-    definidas no escopo de nível superior (global) do módulo.
-    """
-    def __init__(self):
-        self.global_definitions = set()
-
-    def visit_FunctionDef(self, node):
-        # Adiciona apenas se for uma função de nível superior (sem pai de função/classe)
-        # Esta lógica é um placeholder, a forma mais simples é visitar apenas o corpo do módulo.
-        self.global_definitions.add(node.name)
-        # Não chamamos self.generic_visit() para não entrar em funções aninhadas.
-
-    def visit_ClassDef(self, node):
-        # Adiciona apenas se for uma classe de nível superior
-        self.global_definitions.add(node.name)
-        # Não visitamos os filhos para não pegar métodos como definições globais.
-
 class NameObfuscatorTransformer(ast.NodeTransformer):
+
     def __init__(self):
         self.name_map = {}
-        # A lista de proteção continua importante
         self.protected_names = {
-        'rs', '_init_decrypt', '_MASTER_KEY', '_DECRYPT_CACHE',
-        'initialize_globals', 'main_loop', 'register_with_c2',
-        'send_result', 'get_task', 'write_internal_log',
-        'anti_analysis_checks', 'self_install_and_persist',
-        'get_authenticated_headers', 'encrypt_data', 'decrypt_data'
-    }
+            'rs', '_init_decrypt', '_MASTER_KEY', '_DECRYPT_CACHE',
+            'initialize_globals', 'main_loop', 'register_with_c2',
+            'send_result', 'get_task', 'write_internal_log',
+            'anti_analysis_checks', 'self_install_and_persist',
+            'get_authenticated_headers', 'encrypt_data', 'decrypt_data'
+        }
 
     def build_name_map(self, tree):
-        """
-        Constrói o mapa de renomeação usando o novo GlobalDefinitionVisitor.
-        """
-        visitor = GlobalDefinitionVisitor()
-        # Visita apenas os nós do corpo do módulo de nível superior
+        """Constrói o mapa de renomeação apenas para definições de nível global."""
         for node in ast.iter_child_nodes(tree):
-            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
-                visitor.global_definitions.add(node.name)
-
-        for name in visitor.global_definitions:
-            if name not in self.protected_names and not name.startswith('__'):
-                self.name_map[name] = '_p_' + ''.join(random.choices(string.ascii_lowercase, k=10))
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = node.name
+                if name not in self.protected_names and not name.startswith('__'):
+                    self.name_map[name] = '_p_' + ''.join(
+                        random.choices(string.ascii_lowercase, k=10)
+                    )
 
     def visit_Name(self, node: ast.Name) -> ast.Name:
-        """
-        Substitui nomes de funções/classes globais.
-        """
         if node.id in self.name_map:
             node.id = self.name_map[node.id]
         return node
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-        """
-        Renomeia a DEFINIÇÃO da função.
-        """
         if node.name in self.name_map:
             node.name = self.name_map[node.name]
-        # IMPORTANTE: Continuamos a visita para que as CHAMADAS dentro desta função sejam renomeadas.
         self.generic_visit(node)
         return node
+
+    # Cobertura para async def
+    visit_AsyncFunctionDef = visit_FunctionDef
 
     def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
-        """
-        Renomeia a DEFINIÇÃO da classe.
-        """
         if node.name in self.name_map:
             node.name = self.name_map[node.name]
         self.generic_visit(node)
         return node
 
 
-
-# --- Estratégias Concretas ---
-
 class StringObfuscationStrategy(ObfuscationStrategy):
+
     def execute(self, context: BuildContext) -> BuildContext:
         source_code = context.entry_script_path.read_text(encoding="utf-8")
         tree = ast.parse(source_code)
-        
+
         session_obfuscator = SessionObfuscator()
         transformer = StringObfuscatorTransformer(session_obfuscator)
         obfuscated_tree = transformer.visit(tree)
-        
-        # --- INÍCIO DA CORREÇÃO FINAL ---
 
-        # 1. Parseia o código de descriptografia
+        # Parseia o código de descriptografia com indentação limpa
         decrypt_code = session_obfuscator.get_decrypt_function_code()
         decrypt_tree = ast.parse(decrypt_code)
 
-        # 2. Encontra o ponto de inserção: logo após a última importação no script.
-        # Isso garante que as funções injetadas venham depois de todas as dependências.
+        # Encontra o ponto de inserção: logo após o último import
         insert_pos = 0
         for i, node in enumerate(obfuscated_tree.body):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 insert_pos = i + 1
-            # Para de procurar após a primeira linha que não é um import ou docstring
             elif not isinstance(node, (ast.Expr, ast.Constant)):
                 break
 
-        # 3. Injeta as DEFINIÇÕES das funções de descriptografia (TODAS ELAS, na ordem inversa)
-        for node in reversed(decrypt_tree.body):
+        # Injeta apenas nós que não sejam imports duplicados (base64, Cryptodome)
+        existing_imports = {
+            (n.names[0].name if isinstance(n, ast.Import) else n.module)
+            for n in obfuscated_tree.body
+            if isinstance(n, (ast.Import, ast.ImportFrom))
+        }
+        nodes_to_inject = [
+            n for n in decrypt_tree.body
+            if not (
+                isinstance(n, (ast.Import, ast.ImportFrom))
+                and (
+                    getattr(n, 'module', None) in existing_imports
+                    or (isinstance(n, ast.Import) and n.names[0].name in existing_imports)
+                )
+            )
+        ]
+
+        for node in reversed(nodes_to_inject):
             obfuscated_tree.body.insert(insert_pos, node)
 
-        # 4. Cria a CHAMADA de inicialização
+        # Injeta a chamada de inicialização
         init_call = ast.Expr(value=ast.Call(
             func=ast.Name(id='_init_decrypt', ctx=ast.Load()),
             args=[ast.Constant(value=session_obfuscator.get_master_key_b64())],
             keywords=[]
         ))
-
-        # 5. Insere a CHAMADA logo após as definições que acabamos de injetar.
-        obfuscated_tree.body.insert(insert_pos + len(decrypt_tree.body), init_call)
-
-        # --- FIM DA CORREÇÃO FINAL ---
+        obfuscated_tree.body.insert(insert_pos + len(nodes_to_inject), init_call)
 
         ast.fix_missing_locations(obfuscated_tree)
-        context.entry_script_path.write_text(ast.unparse(obfuscated_tree), encoding="utf-8")
+        context.entry_script_path.write_text(
+            ast.unparse(obfuscated_tree), encoding="utf-8"
+        )
+
+        strings_count = sum(
+            1 for n in ast.walk(obfuscated_tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == 'rs'
+        )
+        context.log(f"StringObfuscation: {strings_count} strings ofuscadas.")
+        console.print(f"[bold cyan]  → {strings_count} strings ofuscadas com AES-256-CBC.[/bold cyan]")
         return context
 
+
 class IdentifierManglingStrategy(ObfuscationStrategy):
+
     def execute(self, context: BuildContext) -> BuildContext:
         source_code = context.entry_script_path.read_text(encoding="utf-8")
         tree = ast.parse(source_code)
-        
+
         transformer = NameObfuscatorTransformer()
         transformer.build_name_map(tree)
         obfuscated_tree = transformer.visit(tree)
-        
+
         ast.fix_missing_locations(obfuscated_tree)
-        context.entry_script_path.write_text(ast.unparse(obfuscated_tree), encoding="utf-8")
+        context.entry_script_path.write_text(
+            ast.unparse(obfuscated_tree), encoding="utf-8"
+        )
+
+        count = len(transformer.name_map)
+        context.log(f"IdentifierMangling: {count} identificadores renomeados.")
+        console.print(f"[bold cyan]  → {count} identificadores renomeados.[/bold cyan]")
         return context
