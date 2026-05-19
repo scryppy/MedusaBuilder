@@ -1,30 +1,32 @@
-# string_obfuscator.py (Otimizado)
+# strategies/string_obfuscator.py
 
 import base64
+import textwrap
 from Cryptodome.Cipher import AES
-from Cryptodome.Util.Padding import pad, unpad
+from Cryptodome.Util.Padding import pad
 from Cryptodome.Random import get_random_bytes
+
 
 class SessionObfuscator:
     """
     Gerencia a ofuscação para uma única sessão de build, usando uma chave mestra.
-    Isso é mais eficiente do que gerar uma chave para cada string.
+    Usa AES-256-CBC com IV único por string e chave compartilhada por sessão.
     """
+
     def __init__(self):
-        self.master_key = get_random_bytes(32)  # Chave AES-256 para esta sessão de build
+        self.master_key = get_random_bytes(32)  # Chave AES-256 para esta sessão
 
     def get_master_key_b64(self) -> str:
         """Retorna a chave mestra da sessão, codificada em Base64."""
         return base64.b64encode(self.master_key).decode("utf-8")
 
-    def obfuscate(self, original_string: str) -> tuple[str, str]:
+    def obfuscate(self, original_string: str) -> "tuple[str, str]":
         """
         Ofusca uma string usando a chave mestra da sessão.
         Retorna (iv_b64, encrypted_data_b64).
         """
-        iv = get_random_bytes(AES.block_size)  # IV ainda é único por string para segurança
+        iv = get_random_bytes(AES.block_size)  # IV único por string
         cipher = AES.new(self.master_key, AES.MODE_CBC, iv)
-        
         padded_data = pad(original_string.encode("utf-8"), AES.block_size)
         encrypted_data = cipher.encrypt(padded_data)
 
@@ -37,32 +39,38 @@ class SessionObfuscator:
     def get_decrypt_function_code() -> str:
         """
         Retorna o código-fonte da função de descriptografia que será injetada no agente.
-        A função agora espera a chave mestra como um argumento.
+        Usa textwrap.dedent para garantir indentação limpa e ast.parse seguro.
         """
-        return """
-import base64
-from Cryptodome.Cipher import AES
-from Cryptodome.Util.Padding import unpad
+        code = """
+            import base64
+            from Cryptodome.Cipher import AES
+            from Cryptodome.Util.Padding import unpad
 
-_DECRYPT_CACHE = {}
-_MASTER_KEY = None
+            _DECRYPT_CACHE = {}
+            _MASTER_KEY = None
 
-def _init_decrypt(key_b64):
-    global _MASTER_KEY
-    if _MASTER_KEY is None:
-        _MASTER_KEY = base64.b64decode(key_b64)
+            def _init_decrypt(key_b64):
+                global _MASTER_KEY
+                if _MASTER_KEY is None:
+                    key = base64.b64decode(key_b64)
+                    if len(key) not in (16, 24, 32):
+                        raise ValueError(f"Chave AES invalida: {len(key)} bytes")
+                    _MASTER_KEY = key
 
-def rs(enc_str_b64: str, iv_b64: str) -> str:
-    if enc_str_b64 in _DECRYPT_CACHE:
-        return _DECRYPT_CACHE[enc_str_b64]
-    try:
-        iv = base64.b64decode(iv_b64)
-        enc_str = base64.b64decode(enc_str_b64)
-        cipher = AES.new(_MASTER_KEY, AES.MODE_CBC, iv)
-        decrypted = unpad(cipher.decrypt(enc_str), AES.block_size)
-        result = decrypted.decode("utf-8")
-        _DECRYPT_CACHE[enc_str_b64] = result
-        return result
-    except Exception:
-        return ""
-"""
+            def rs(enc_str_b64, iv_b64):
+                if enc_str_b64 in _DECRYPT_CACHE:
+                    return _DECRYPT_CACHE[enc_str_b64]
+                try:
+                    if _MASTER_KEY is None:
+                        return ""
+                    iv = base64.b64decode(iv_b64)
+                    enc_str = base64.b64decode(enc_str_b64)
+                    cipher = AES.new(_MASTER_KEY, AES.MODE_CBC, iv)
+                    decrypted = unpad(cipher.decrypt(enc_str), AES.block_size)
+                    result = decrypted.decode("utf-8")
+                    _DECRYPT_CACHE[enc_str_b64] = result
+                    return result
+                except Exception:
+                    return ""
+        """
+        return textwrap.dedent(code).strip()
